@@ -185,6 +185,25 @@ var (
 			Help:           "Counter for status of consistency checks between etcd and watch cache",
 			StabilityLevel: compbasemetrics.INTERNAL,
 		}, []string{"group", "resource", "status"})
+
+	// New metrics for ConsistentListFromCache optimizations
+	ConsistentReadOptimizationTotal = compbasemetrics.NewCounterVec(
+		&compbasemetrics.CounterOpts{
+			Namespace:      namespace,
+			Subsystem:      subsystem,
+			Name:           "consistent_read_optimization_total",
+			Help:           "Counter for consistent read optimizations by type (coalesced, cache_fresh, etcd_query, coalesced_pending)",
+			StabilityLevel: compbasemetrics.ALPHA,
+		}, []string{"optimization_type"})
+
+	AdaptiveTimeoutTotal = compbasemetrics.NewCounterVec(
+		&compbasemetrics.CounterOpts{
+			Namespace:      namespace,
+			Subsystem:      subsystem,
+			Name:           "adaptive_timeout_total",
+			Help:           "Counter for adaptive timeout usage during high load scenarios",
+			StabilityLevel: compbasemetrics.ALPHA,
+		}, []string{"group", "resource", "timeout_type"})
 )
 
 var registerMetrics sync.Once
@@ -208,6 +227,8 @@ func Register() {
 		legacyregistry.MustRegister(WatchCacheReadWait)
 		legacyregistry.MustRegister(ConsistentReadTotal)
 		legacyregistry.MustRegister(StorageConsistencyCheckTotal)
+		legacyregistry.MustRegister(ConsistentReadOptimizationTotal)
+		legacyregistry.MustRegister(AdaptiveTimeoutTotal)
 	})
 }
 

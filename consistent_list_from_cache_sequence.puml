@@ -1,0 +1,159 @@
+@startuml ConsistentListFromCache Sequence Diagram
+
+title ConsistentListFromCache Flow During Namespace Deletion
+
+actor "Namespace Controller" as NC
+participant "API Server" as API
+participant "CacheDelegator" as CD
+participant "Watch Cache" as WC
+participant "etcd" as ETCD
+participant "Namespace Deleter" as ND
+
+== Namespace Deletion Initiated ==
+
+NC -> API: DELETE /api/v1/namespaces/test-ns
+API -> ND: Delete namespace resources
+
+== Resource Discovery Phase ==
+
+ND -> API: GET /api (discovery)
+API -> CD: GetList(key="", opts={ResourceVersion=""})
+
+note over CD: ConsistentRead=true because RV=""
+
+CD -> ETCD: GetCurrentResourceVersion()
+ETCD --> CD: currentRV=12345
+
+note over CD: Set opts.ResourceVersion="12345"
+
+CD -> WC: notFresh(12345)?
+WC --> CD: true (cache RV=12340)
+
+note over CD: Cache is behind, need to wait
+
+CD -> ETCD: RequestWatchProgress()
+ETCD --> WC: Progress notification
+WC -> WC: Update resourceVersion=12345
+
+CD -> WC: WaitUntilFreshAndList(RV=12345)
+WC --> CD: Resource list from cache
+
+CD --> API: Discovery response
+API --> ND: Available resource types
+
+== Secret Deletion Storm Begins ==
+
+loop For each resource type (secrets, configmaps, etc.)
+    
+    ND -> API: LIST /api/v1/namespaces/test-ns/secrets
+    API -> CD: GetList(key="/secrets", opts={ResourceVersion=""})
+    
+    note over CD: Another ConsistentRead=true
+    
+    CD -> ETCD: GetCurrentResourceVersion()
+    ETCD --> CD: currentRV=12346
+    
+    CD -> WC: notFresh(12346)?
+    WC --> CD: true (cache RV=12345)
+    
+    CD -> ETCD: RequestWatchProgress()
+    ETCD --> WC: Progress notification
+    WC -> WC: Update resourceVersion=12346
+    
+    CD -> WC: WaitUntilFreshAndList(RV=12346)
+    WC --> CD: Secret list (198K+ cache fetches)
+    
+    CD --> API: Secret list response
+    API --> ND: Secrets to delete
+    
+    == Parallel Secret Deletions ==
+    
+    par
+        ND -> API: DELETE /api/v1/namespaces/test-ns/secrets/secret-1
+        API -> ETCD: Delete secret-1
+        ETCD --> WC: Watch event (DELETE secret-1)
+        WC -> WC: Invalidate cache entry
+    also
+        ND -> API: DELETE /api/v1/namespaces/test-ns/secrets/secret-2
+        API -> ETCD: Delete secret-2
+        ETCD --> WC: Watch event (DELETE secret-2)
+        WC -> WC: Invalidate cache entry
+    also
+        ND -> API: DELETE /api/v1/namespaces/test-ns/secrets/secret-N
+        API -> ETCD: Delete secret-N
+        ETCD --> WC: Watch event (DELETE secret-N)
+        WC -> WC: Invalidate cache entry
+    end
+    
+    note over WC: Cache thrashing due to\nrapid invalidations
+    
+end
+
+== Cache Consistency Failures ==
+
+ND -> API: LIST /api/v1/namespaces/test-ns/secrets (verification)
+API -> CD: GetList(key="/secrets", opts={ResourceVersion=""})
+
+CD -> ETCD: GetCurrentResourceVersion()
+ETCD --> CD: currentRV=12500
+
+CD -> WC: notFresh(12500)?
+WC --> CD: true (cache RV=12480)
+
+CD -> ETCD: RequestWatchProgress()
+note over CD: Timeout waiting for cache\nto catch up (TooLargeResourceVersion)
+
+CD -> CD: fallback=true
+CD -> ETCD: GetList(key="/secrets", opts={ResourceVersion=""})
+ETCD --> CD: Direct etcd query result
+
+note over CD: IOPS spike due to fallback
+
+CD --> API: Secret list (from etcd)
+API --> ND: Remaining secrets
+
+== Metrics Impact ==
+
+note over CD: Metrics recorded:\n- apiserver_cache_list_fetched_objects_total{secrets}=198931\n- ConsistentReadTotal{fallback=true}++\n- etcd IOPS spike
+
+== Other Resource Types ==
+
+loop For configmaps, services, pods, etc.
+    note over ND: Similar pattern repeats\nfor each resource type
+    
+    ND -> API: LIST /api/v1/namespaces/test-ns/{resource}
+    API -> CD: GetList with ConsistentRead=true
+    
+    alt Cache is fresh
+        CD -> WC: Serve from cache
+        WC --> CD: Cached data
+    else Cache is stale
+        CD -> ETCD: GetCurrentResourceVersion()
+        CD -> ETCD: RequestWatchProgress()
+        alt Cache catches up
+            CD -> WC: WaitUntilFreshAndList()
+            WC --> CD: Fresh cached data
+        else Timeout/Error
+            CD -> ETCD: Fallback direct query
+            ETCD --> CD: Direct etcd data
+            note over CD: Additional IOPS load
+        end
+    end
+    
+    CD --> API: Resource list
+    API --> ND: Resources to delete
+end
+
+== Final Cleanup ==
+
+ND -> API: Remove finalizer from namespace
+API -> ETCD: Update namespace (remove finalizer)
+ETCD --> WC: Watch event (namespace updated)
+
+NC -> API: DELETE namespace (final)
+API -> ETCD: Delete namespace object
+ETCD --> WC: Watch event (namespace deleted)
+
+note over API: Namespace deletion complete\nTotal IOPS impact:\n- Base deletion operations\n- ConsistentRead RV queries\n- Watch progress requests\n- Fallback queries\n- Cache invalidation overhead
+
+@enduml 

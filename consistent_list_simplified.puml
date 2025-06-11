@@ -1,0 +1,90 @@
+@startuml ConsistentListFromCache - Simplified Flow
+
+title ConsistentListFromCache: Key Decision Points & IOPS Impact
+
+participant "Client" as C
+participant "CacheDelegator" as CD
+participant "Watch Cache" as WC
+participant "etcd" as E
+
+== Standard LIST Request ==
+
+C -> CD: LIST secrets (ResourceVersion="")
+note over CD: ResourceVersion="" triggers\nConsistentRead=true
+
+== Consistency Check Process ==
+
+CD -> E: GetCurrentResourceVersion()
+note right: **IOPS +1**\nExtra etcd query for every\nconsistent read
+
+E --> CD: currentRV=1000
+
+CD -> WC: notFresh(1000)?
+note over WC: Check if cache RV >= 1000
+
+alt Cache is Fresh (RV >= 1000)
+    WC --> CD: false (cache is fresh)
+    CD -> WC: WaitUntilFreshAndList(1000)
+    WC --> CD: Data from cache
+    note over CD: **IOPS +0**\nServed from cache
+    
+else Cache is Stale (RV < 1000)
+    WC --> CD: true (cache is stale)
+    
+    CD -> E: RequestWatchProgress()
+    note right: **IOPS +1**\nForce etcd to send progress
+    
+    E --> WC: Progress notification
+    WC -> WC: Update to latest RV
+    
+    CD -> WC: WaitUntilFreshAndList(1000)
+    
+    alt Cache Catches Up in Time
+        WC --> CD: Data from cache
+        note over CD: **IOPS +1**\n(only the progress request)
+        
+    else Timeout or Error
+        note over CD: TooLargeResourceVersion error
+        CD -> E: GetList() - Fallback
+        note right: **IOPS +1**\nDirect etcd query fallback
+        E --> CD: Data from etcd
+        note over CD: **Total IOPS +3**\n1. GetCurrentResourceVersion\n2. RequestWatchProgress\n3. Fallback GetList
+    end
+end
+
+CD --> C: Response data
+
+== High-Volume Scenario (Your Case) ==
+
+note over C, E: During namespace deletion with 198K+ secrets
+
+loop 198,000+ secret operations
+    
+    C -> CD: LIST/DELETE secrets
+    
+    alt Every LIST triggers consistency check
+        CD -> E: GetCurrentResourceVersion()
+        note right: **IOPS +198K**\nOne per LIST operation
+        
+        CD -> E: RequestWatchProgress()
+        note right: **IOPS +198K**\nCache constantly behind
+        
+        alt Cache can't keep up (likely)
+            CD -> E: Fallback GetList()
+            note right: **IOPS +198K**\nFallback queries
+        end
+    end
+    
+    C -> CD: DELETE secret-N
+    CD -> E: Delete secret-N
+    note right: **IOPS +198K**\nActual delete operations
+    
+    E --> WC: Watch event (delete)
+    WC -> WC: Invalidate cache
+    note over WC: Cache constantly\ninvalidated
+    
+end
+
+note over C, E: **Total IOPS Amplification:**\nBase: 198K delete operations\nAmplified: 198K × 3-4 = 594K-792K operations\n\n**Root Cause:**\nConsistentListFromCache + High secret volume\n+ Rapid cache invalidation = IOPS storm
+
+@enduml 
