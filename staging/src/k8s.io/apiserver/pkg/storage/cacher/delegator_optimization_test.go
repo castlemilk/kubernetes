@@ -17,17 +17,12 @@ limitations under the License.
 package cacher
 
 import (
-	"context"
 	"os"
 	"strconv"
-	"sync"
 	"testing"
 	"time"
 
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/features"
-	"k8s.io/apiserver/pkg/storage"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 )
@@ -139,39 +134,3 @@ func TestGlobalConsistentReadCoalescerInitialization(t *testing.T) {
 		t.Error("Expected pendingRequests to be initialized")
 	}
 }
-
-// Mock implementations for testing
-type mockStorageWithCallCount struct {
-	callCount int
-	mu        sync.Mutex
-}
-
-func (m *mockStorageWithCallCount) GetCurrentResourceVersion(ctx context.Context) (uint64, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.callCount++
-	return 1000, nil
-}
-
-func (m *mockStorageWithCallCount) Versioner() storage.Versioner { return nil }
-func (m *mockStorageWithCallCount) Create(ctx context.Context, key string, obj, out runtime.Object, ttl uint64) error {
-	return nil
-}
-func (m *mockStorageWithCallCount) Delete(ctx context.Context, key string, out runtime.Object, preconditions *storage.Preconditions, validateDeletion storage.ValidateObjectFunc, cachedExistingObject runtime.Object, opts storage.DeleteOptions) error {
-	return nil
-}
-func (m *mockStorageWithCallCount) Watch(ctx context.Context, key string, opts storage.ListOptions) (watch.Interface, error) {
-	return nil, nil
-}
-func (m *mockStorageWithCallCount) Get(ctx context.Context, key string, opts storage.GetOptions, objPtr runtime.Object) error {
-	return nil
-}
-func (m *mockStorageWithCallCount) GetList(ctx context.Context, key string, opts storage.ListOptions, listObj runtime.Object) error {
-	return nil
-}
-func (m *mockStorageWithCallCount) GuaranteedUpdate(ctx context.Context, key string, destination runtime.Object, ignoreNotFound bool, preconditions *storage.Preconditions, tryUpdate storage.UpdateFunc, cachedExistingObject runtime.Object) error {
-	return nil
-}
-func (m *mockStorageWithCallCount) Count(key string) (int64, error)                { return 0, nil }
-func (m *mockStorageWithCallCount) ReadinessCheck() error                          { return nil }
-func (m *mockStorageWithCallCount) RequestWatchProgress(ctx context.Context) error { return nil }
