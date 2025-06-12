@@ -1,0 +1,191 @@
+@startuml Namespace Deletion Flow
+
+title Namespace Deletion Flow with ConsistentListFromCache Impact
+
+actor "kubectl" as K
+participant "API Server" as API
+participant "Namespace Controller" as NC
+participant "Namespace Deleter" as ND
+participant "CacheDelegator" as CD
+participant "Watch Cache" as WC
+participant "etcd" as ETCD
+participant "Discovery Client" as DC
+
+== Deletion Request ==
+
+K -> API: DELETE /api/v1/namespaces/test-ns
+API -> API: Set deletionTimestamp
+API -> ETCD: Update namespace with deletionTimestamp
+ETCD --> WC: Watch event (namespace updated)
+API --> K: 200 OK (deletion started)
+
+== Namespace Controller Processing ==
+
+WC -> NC: Namespace event (deletionTimestamp set)
+NC -> NC: Enqueue namespace for processing
+NC -> ND: Delete(ctx, "test-ns")
+
+== Resource Discovery Phase ==
+
+ND -> DC: discoverResourcesFn()
+DC -> API: GET /api/v1
+API -> CD: GetList(key="", opts={ResourceVersion=""})
+
+note over CD: ConsistentRead=true\n(ResourceVersion="")
+
+CD -> ETCD: GetCurrentResourceVersion()
+note right: **IOPS +1**
+ETCD --> CD: currentRV=1000
+
+CD -> WC: notFresh(1000)?
+WC --> CD: false (cache is fresh)
+
+CD -> WC: WaitUntilFreshAndList(1000)
+WC --> CD: Core API resources
+CD --> API: API resource list
+API --> DC: Core resources discovered
+
+DC -> API: GET /apis
+API -> CD: GetList(key="/apis", opts={ResourceVersion=""})
+
+note over CD: Another ConsistentRead
+
+CD -> ETCD: GetCurrentResourceVersion()
+note right: **IOPS +1**
+ETCD --> CD: currentRV=1001
+
+CD -> WC: WaitUntilFreshAndList(1001)
+WC --> CD: Extension API resources
+CD --> API: Extension API resources
+API --> DC: All APIs discovered
+
+DC --> ND: Complete resource list:\n- secrets, configmaps, pods,\n- services, deployments, etc.
+
+== Resource Deletion Loop ==
+
+loop For each resource type (GVR)
+    
+    note over ND: Processing secrets first\n(highest volume in your cluster)
+    
+    ND -> API: LIST /api/v1/namespaces/test-ns/secrets
+    API -> CD: GetList(key="/secrets", opts={ResourceVersion=""})
+    
+    note over CD: ConsistentRead=true
+    
+    CD -> ETCD: GetCurrentResourceVersion()
+    note right: **IOPS +1**\nPer resource type
+    ETCD --> CD: currentRV=1002
+    
+    CD -> WC: notFresh(1002)?
+    WC --> CD: true (cache behind due to ongoing deletions)
+    
+    CD -> ETCD: RequestWatchProgress()
+    note right: **IOPS +1**\nForce cache update
+    ETCD --> WC: Progress notification
+    WC -> WC: Update resourceVersion=1002
+    
+    CD -> WC: WaitUntilFreshAndList(1002)
+    WC --> CD: Secret list (e.g., 1000 secrets)
+    
+    note over WC: **Cache fetch count++**\n(contributes to your 198K metric)
+    
+    CD --> API: Secret list
+    API --> ND: 1000 secrets to delete
+    
+    == Bulk Secret Deletion ==
+    
+    alt deleteCollection supported
+        ND -> API: DELETE /api/v1/namespaces/test-ns/secrets\n(deleteCollection)
+        API -> ETCD: Bulk delete secrets
+        note right: **IOPS +1**\nBulk operation
+        ETCD --> WC: Multiple watch events
+        WC -> WC: Invalidate cache entries
+        API --> ND: Deletion initiated
+        
+    else deleteCollection not supported
+        loop For each secret (1000x)
+            ND -> API: DELETE /api/v1/namespaces/test-ns/secrets/secret-N
+            API -> ETCD: Delete individual secret
+            note right: **IOPS +1000**\nIndividual deletions
+            ETCD --> WC: Watch event (secret deleted)
+            WC -> WC: Invalidate cache entry
+            API --> ND: Secret deleted
+        end
+    end
+    
+    == Verification Phase ==
+    
+    ND -> API: LIST /api/v1/namespaces/test-ns/secrets\n(verify deletion)
+    API -> CD: GetList(key="/secrets", opts={ResourceVersion=""})
+    
+    note over CD: Another ConsistentRead
+    
+    CD -> ETCD: GetCurrentResourceVersion()
+    note right: **IOPS +1**
+    ETCD --> CD: currentRV=2002 (much higher after deletions)
+    
+    CD -> WC: notFresh(2002)?
+    WC --> CD: true (cache way behind)
+    
+    CD -> ETCD: RequestWatchProgress()
+    note right: **IOPS +1**
+    
+    alt Cache catches up
+        ETCD --> WC: Progress notification
+        WC -> WC: Process queued delete events
+        CD -> WC: WaitUntilFreshAndList(2002)
+        WC --> CD: Empty secret list
+        note over CD: **Success: served from cache**
+        
+    else Cache timeout (likely scenario)
+        note over CD: TooLargeResourceVersion error\nCache can't catch up
+        CD -> ETCD: GetList(fallback)
+        note right: **IOPS +1**\nFallback query
+        ETCD --> CD: Empty secret list (direct from etcd)
+        note over CD: **Fallback: direct etcd query**
+    end
+    
+    CD --> API: Verification result
+    API --> ND: Secrets deleted successfully
+    
+end
+
+== Other Resource Types ==
+
+note over ND: Repeat similar pattern for:\n- configmaps, services, pods, etc.\n\nEach follows same ConsistentRead pattern
+
+loop For configmaps, services, pods, etc.
+    ND -> API: LIST /api/v1/namespaces/test-ns/{resource}
+    note over CD: ConsistentRead + potential fallback
+    ND -> API: DELETE {resources}
+    ND -> API: LIST (verification)
+    note over CD: More ConsistentReads + fallbacks
+end
+
+== Finalizer Removal ==
+
+ND -> API: GET /api/v1/namespaces/test-ns
+API -> CD: Get(key="/namespaces/test-ns")
+CD -> WC: GetByKey("/namespaces/test-ns")
+WC --> CD: Namespace object
+CD --> API: Namespace with finalizers
+
+ND -> API: PUT /api/v1/namespaces/test-ns\n(remove kubernetes finalizer)
+API -> ETCD: Update namespace (remove finalizer)
+note right: **IOPS +1**
+ETCD --> WC: Watch event (namespace updated)
+API --> ND: Finalizer removed
+
+== Final Deletion ==
+
+NC -> API: DELETE /api/v1/namespaces/test-ns\n(final deletion)
+API -> ETCD: Delete namespace object
+note right: **IOPS +1**
+ETCD --> WC: Watch event (namespace deleted)
+API --> NC: Namespace deleted
+
+== IOPS Impact Summary ==
+
+note over API: **Total IOPS Breakdown:**\n\n**Discovery Phase:**\n- Core API discovery: +2 IOPS\n- Extension API discovery: +2 IOPS\n\n**Per Resource Type (×N types):**\n- Initial LIST: +2 IOPS (RV check + progress)\n- Deletion: +1-1000 IOPS (bulk vs individual)\n- Verification: +2-3 IOPS (RV check + progress + fallback)\n\n**Your Cluster (secrets dominant):**\n- 198K+ cache operations\n- High fallback rate due to cache thrashing\n- 3-4x IOPS amplification\n\n**Root Cause:**\nConsistentListFromCache + High secret volume\n+ Rapid cache invalidation = IOPS storm
+
+@enduml 

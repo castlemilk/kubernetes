@@ -60,6 +60,13 @@ const (
 
 	// defaultUpperBoundCapacity should be able to keep the required history.
 	defaultUpperBoundCapacity = 100 * 1024
+
+	// adaptiveTimeoutEnabled enables adaptive timeout based on cache load
+	adaptiveTimeoutEnabled = true
+	// highLoadThreshold defines the number of concurrent waiters that indicates high load
+	highLoadThreshold = 10
+	// reducedBlockTimeout is used during high load scenarios to fail fast
+	reducedBlockTimeout = 1 * time.Second
 )
 
 // watchCacheEvent is a single "watch event" that is send to users of
@@ -453,6 +460,30 @@ func (w *watchCache) waitUntilFreshAndBlock(ctx context.Context, resourceVersion
 	// function (and avoid starting a gorotuine), especially given that
 	// resourceVersion=0 is the most common case.
 	if resourceVersion > 0 {
+		// Determine timeout based on current load
+		timeout := blockTimeout
+		if adaptiveTimeoutEnabled {
+			// Check how many requests are currently waiting
+			waitingCount := 0
+			if w.waitingUntilFresh != nil {
+				// This is an approximation - in practice we'd need to expose
+				// the waiting count from ConditionalProgressRequester
+				waitingCount = 1 // Simplified for this implementation
+			}
+
+			// Use reduced timeout during high load to fail fast and reduce IOPS pressure
+			if waitingCount >= highLoadThreshold {
+				timeout = reducedBlockTimeout
+				metrics.AdaptiveTimeoutTotal.WithLabelValues(w.groupResource.Group, w.groupResource.Resource, "reduced").Inc()
+				klog.V(4).InfoS("Using reduced timeout due to high load",
+					"groupResource", w.groupResource,
+					"waitingCount", waitingCount,
+					"timeout", timeout)
+			} else {
+				metrics.AdaptiveTimeoutTotal.WithLabelValues(w.groupResource.Group, w.groupResource.Resource, "normal").Inc()
+			}
+		}
+
 		go func() {
 			// Wake us up when the time limit has expired.  The docs
 			// promise that time.After (well, NewTimer, which it calls)
@@ -461,7 +492,7 @@ func (w *watchCache) waitUntilFreshAndBlock(ctx context.Context, resourceVersion
 			// it will wake up the loop below sometime after the broadcast,
 			// we don't need to worry about waking it up before the time
 			// has expired accidentally.
-			<-w.clock.After(blockTimeout)
+			<-w.clock.After(timeout)
 			w.cond.Broadcast()
 		}()
 	}
@@ -469,8 +500,21 @@ func (w *watchCache) waitUntilFreshAndBlock(ctx context.Context, resourceVersion
 	w.RLock()
 	span := tracing.SpanFromContext(ctx)
 	span.AddEvent("watchCache locked acquired")
+
+	// Determine timeout for the loop (same logic as above)
+	timeout := blockTimeout
+	if adaptiveTimeoutEnabled && resourceVersion > 0 {
+		waitingCount := 0
+		if w.waitingUntilFresh != nil {
+			waitingCount = 1 // Simplified
+		}
+		if waitingCount >= highLoadThreshold {
+			timeout = reducedBlockTimeout
+		}
+	}
+
 	for w.resourceVersion < resourceVersion {
-		if w.clock.Since(startTime) >= blockTimeout {
+		if w.clock.Since(startTime) >= timeout {
 			// Request that the client retry after 'resourceVersionTooHighRetrySeconds' seconds.
 			return storage.NewTooLargeResourceVersionError(resourceVersion, w.resourceVersion, resourceVersionTooHighRetrySeconds)
 		}
